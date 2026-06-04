@@ -28,12 +28,18 @@ import (
 
 var (
 	tsnetSrv *tsnet.Server
-	ownerID  tailcfg.UserID // owner of the system tailscaled node, set at startup
+
+	ownerMu      sync.Mutex
+	ownerID      tailcfg.UserID // owner of the system tailscaled node; 0 until known
+	ownerLastTry time.Time      // last time we tried to populate ownerID
 )
 
 func main() {
 	ownerName, uid := getOwnerInfo()
+	ownerMu.Lock()
 	ownerID = uid
+	ownerLastTry = time.Now()
+	ownerMu.Unlock()
 
 	hostname := os.Getenv("TS_HOSTNAME")
 	if hostname == "" {
@@ -479,10 +485,29 @@ func loadSession(path string) ([]record, error) {
 	return records, nil
 }
 
+// ensureOwnerID returns the cached owner UserID, lazily re-querying the system
+// tailscaled if it isn't yet known. The re-query is rate-limited so a tailscaled
+// that's persistently unreachable or unauthenticated doesn't get hammered.
+func ensureOwnerID() tailcfg.UserID {
+	ownerMu.Lock()
+	defer ownerMu.Unlock()
+	if ownerID != 0 {
+		return ownerID
+	}
+	if time.Since(ownerLastTry) < 30*time.Second {
+		return 0
+	}
+	ownerLastTry = time.Now()
+	_, uid := getOwnerInfo()
+	ownerID = uid
+	return ownerID
+}
+
 // isOwner reports whether the request comes from the owner of the system
-// tailscaled node (identified at startup).
+// tailscaled node.
 func isOwner(r *http.Request) bool {
-	if ownerID == 0 {
+	uid := ensureOwnerID()
+	if uid == 0 {
 		return false
 	}
 	lc, err := tsnetSrv.LocalClient()
@@ -493,7 +518,7 @@ func isOwner(r *http.Request) bool {
 	if err != nil {
 		return false
 	}
-	return whois.UserProfile.ID == ownerID
+	return whois.UserProfile.ID == uid
 }
 
 func handleIndex(w http.ResponseWriter, r *http.Request) {
